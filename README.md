@@ -65,6 +65,45 @@ curl -X POST https://your-static-domain.ngrok-free.app/chat/completions \
   }'
 ```
 
+## CLI Mode
+
+The binary also supports a one-shot CLI mode in addition to the server.
+Default model is `gpt-5.3-codex`. Streaming to stdout is enabled by default.
+
+### Examples
+
+```bash
+# File input, write output
+codex-openai-proxy cli -f input.txt -o output.txt
+
+# File input with explicit model
+codex-openai-proxy cli -f input.txt -o output.txt --model gpt-5.3-codex
+
+# Prompt only (streams to stdout + optionally writes output)
+codex-openai-proxy cli -p "What is the weather?" -o output.txt
+
+# Prompt prepended to file (joined with "\n")
+codex-openai-proxy cli -p "Summarize:" -f input.txt
+
+# Disable streaming to stdout
+codex-openai-proxy cli -p "Silent run" --no-stdout -o output.txt
+```
+
+### CLI Flags
+
+```bash
+codex-openai-proxy cli [OPTIONS]
+
+Options:
+  -f, --file <FILE>       Input file to read
+  -p, --prompt <PROMPT>   Prompt to prepend
+  -o, --output <FILE>     Output file to write
+      --model <MODEL>     Model to use [default: gpt-5.3-codex]
+      --no-stdout         Disable streaming to stdout
+```
+
+At least one of `-p/--prompt` or `-f/--file` is required.
+
 ## How It Works
 
 ### Request Flow
@@ -113,6 +152,8 @@ curl -X POST https://your-static-domain.ngrok-free.app/chat/completions \
 codex-openai-proxy [OPTIONS]
 
 Options:
+      serve                Run the HTTP proxy server (default)
+      cli                  Run a one-shot CLI request
   -p, --port <PORT>          Port to listen on [default: 8080]
       --auth-path <PATH>     Path to Codex auth.json [default: ~/.codex/auth.json]
   -h, --help                 Print help
@@ -163,14 +204,14 @@ cat ~/.codex/auth.json | jq .
 **Backend Errors:**
 ```bash
 # Check proxy logs for detailed error messages
-RUST_LOG=debug cargo run
+RUST_LOG=debug cargo run -- serve
 ```
 
 ### Debug Mode
 
 ```bash
 # Run with debug logging
-RUST_LOG=debug cargo run -- --port 8080
+RUST_LOG=debug cargo run -- serve --port 8080
 
 # Test with verbose curl
 curl -v -X POST http://localhost:8080/v1/chat/completions \

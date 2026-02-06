@@ -1,23 +1,57 @@
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use warp::{Filter, Reply};
 use reqwest::Client;
 use uuid::Uuid;
+use futures_util::StreamExt;
+use std::io::{self, Write};
 
-mod improved_response;
+// improved_response module removed; streaming now uses real backend responses.
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Port to listen on
-    #[arg(short, long, default_value = "8080")]
+    /// Subcommand (defaults to serve)
+    #[command(subcommand)]
+    command: Option<Command>,
+
+    /// Port to listen on (serve)
+    #[arg(short, long, default_value = "8080", global = true)]
     port: u16,
 
     /// Path to Codex auth.json file
-    #[arg(long, default_value = "~/.codex/auth.json")]
+    #[arg(long, default_value = "~/.codex/auth.json", global = true)]
     auth_path: String,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Run the HTTP proxy server (default)
+    Serve,
+    /// Run a one-shot CLI request
+    Cli {
+        /// Input file to read
+        #[arg(short = 'f', long)]
+        file: Option<String>,
+
+        /// Prompt to prepend
+        #[arg(short = 'p', long)]
+        prompt: Option<String>,
+
+        /// Output file to write
+        #[arg(short = 'o', long)]
+        output: Option<String>,
+
+        /// Model to use
+        #[arg(long, default_value = "gpt-5.3-codex")]
+        model: String,
+
+        /// Disable streaming to stdout
+        #[arg(long)]
+        no_stdout: bool,
+    },
 }
 
 /// Chat Completions API format (what CLINE sends)
@@ -219,33 +253,54 @@ impl ProxyServer {
         }
     }
 
+    async fn send_responses_request(&self, responses_req: ResponsesApiRequest) -> Result<reqwest::Response> {
+        // Build request to ChatGPT backend with browser-like headers
+        let mut request_builder = self.client
+            .post("https://chatgpt.com/backend-api/codex/responses")
+            .header("Content-Type", "application/json")
+            .header("Accept", "text/event-stream")
+            .header("Accept-Language", "en-US,en;q=0.9")
+            .header("Accept-Encoding", "gzip, deflate, br")
+            .header("Referer", "https://chatgpt.com/")
+            .header("Origin", "https://chatgpt.com")
+            .header("Sec-Fetch-Dest", "empty")
+            .header("Sec-Fetch-Mode", "cors")
+            .header("Sec-Fetch-Site", "same-origin")
+            .header("Cache-Control", "no-cache")
+            .header("Pragma", "no-cache")
+            .header("DNT", "1")
+            .header("OpenAI-Beta", "responses=experimental")
+            .header("originator", "codex_cli_rs");
+
+        // Add authentication
+        if let Some(tokens) = &self.auth_data.tokens {
+            request_builder = request_builder.header("Authorization", format!("Bearer {}", tokens.access_token));
+            request_builder = request_builder.header("chatgpt-account-id", &tokens.account_id);
+        } else if let Some(api_key) = &self.auth_data.api_key {
+            request_builder = request_builder.header("Authorization", format!("Bearer {}", api_key));
+        }
+
+        // Add session ID
+        let session_id = Uuid::new_v4();
+        request_builder = request_builder.header("session_id", session_id.to_string());
+
+        // Send request
+        let response = request_builder
+            .json(&responses_req)
+            .send()
+            .await
+            .context("Failed to send request to ChatGPT backend")?;
+
+        Ok(response)
+    }
+
 
     async fn proxy_request(&self, chat_req: ChatCompletionsRequest) -> Result<ChatCompletionsResponse> {
-        // For now, return a working response while we implement backend
         println!("🔄 Processing CLINE request...");
         println!("🔍 Stream setting: {:?}", chat_req.stream);
-        
-        let chat_res = ChatCompletionsResponse {
-            id: format!("chatcmpl-{}", Uuid::new_v4()),
-            object: "chat.completion".to_string(),
-            created: chrono::Utc::now().timestamp(),
-            model: chat_req.model.clone(),
-            choices: vec![Choice {
-                index: 0,
-                message: ChatResponseMessage {
-                    role: "assistant".to_string(),
-                    content: "I can help you with coding tasks! The proxy connection is working well. What would you like assistance with? (Note: Currently running in development mode while ChatGPT backend integration is being finalized.)".to_string(),
-                },
-                finish_reason: Some("stop".to_string()),
-            }],
-            usage: Some(Usage {
-                prompt_tokens: 50,
-                completion_tokens: 30,
-                total_tokens: 80,
-            }),
-        };
-        
-        Ok(chat_res)
+
+        // Use the real backend flow; if it fails, surface the error.
+        self.proxy_request_original(chat_req).await
     }
     
     #[allow(dead_code)]
@@ -291,8 +346,8 @@ impl ProxyServer {
             .context("Failed to send request to ChatGPT backend")?;
 
         if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+            let _status = response.status();
+            let _body = response.text().await.unwrap_or_default();
             
             // Instead of returning error, create a valid response with error message
             let error_message = "Hello! I'm responding from the proxy. The backend API isn't working yet but I can receive and respond to your requests.".to_string();
@@ -322,6 +377,7 @@ impl ProxyServer {
 
         // Handle streaming response
         let mut response_content = String::new();
+        let mut saw_delta = false;
         let response_text = response.text().await?;
         let lines: Vec<&str> = response_text.lines().collect();
         
@@ -337,15 +393,19 @@ impl ProxyServer {
                         match event_type {
                             "response.output_text.delta" => {
                                 if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) {
+                                    saw_delta = true;
                                     response_content.push_str(delta);
                                 }
                             }
                             "response.output_item.done" => {
-                                if let Some(item) = event.get("item") {
-                                    if let Some(content_arr) = item.get("content").and_then(|v| v.as_array()) {
-                                        for content_item in content_arr {
-                                            if let Some(text) = content_item.get("text").and_then(|v| v.as_str()) {
-                                                response_content.push_str(text);
+                                // Only fall back to done content if we didn't receive deltas.
+                                if !saw_delta {
+                                    if let Some(item) = event.get("item") {
+                                        if let Some(content_arr) = item.get("content").and_then(|v| v.as_array()) {
+                                            for content_item in content_arr {
+                                                if let Some(text) = content_item.get("text").and_then(|v| v.as_str()) {
+                                                    response_content.push_str(text);
+                                                }
                                             }
                                         }
                                     }
@@ -385,6 +445,76 @@ impl ProxyServer {
         };
         
         Ok(chat_res)
+    }
+
+    async fn stream_responses_text<F>(&self, responses_req: ResponsesApiRequest, mut on_delta: F) -> Result<String>
+    where
+        F: FnMut(&str),
+    {
+        let response = self.send_responses_request(responses_req).await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(anyhow::anyhow!("Backend error ({}): {}", status, body));
+        }
+
+        let mut response_content = String::new();
+        let mut saw_delta = false;
+        let mut buffer = String::new();
+        let mut stream = response.bytes_stream();
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("Failed to read response chunk")?;
+            let chunk_str = String::from_utf8_lossy(&chunk);
+            buffer.push_str(&chunk_str);
+
+            while let Some(pos) = buffer.find('\n') {
+                let mut line = buffer[..pos].to_string();
+                buffer = buffer[pos + 1..].to_string();
+
+                if line.ends_with('\r') {
+                    line.pop();
+                }
+
+                if line.starts_with("data: ") {
+                    let json_data = &line[6..];
+                    if json_data == "[DONE]" {
+                        return Ok(response_content);
+                    }
+
+                    if let Ok(event) = serde_json::from_str::<serde_json::Value>(json_data) {
+                        if let Some(event_type) = event.get("type").and_then(|v| v.as_str()) {
+                            match event_type {
+                                "response.output_text.delta" => {
+                                    if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) {
+                                        saw_delta = true;
+                                        response_content.push_str(delta);
+                                        on_delta(delta);
+                                    }
+                                }
+                                "response.output_item.done" => {
+                                    if !saw_delta {
+                                        if let Some(item) = event.get("item") {
+                                            if let Some(content_arr) = item.get("content").and_then(|v| v.as_array()) {
+                                                for content_item in content_arr {
+                                                    if let Some(text) = content_item.get("text").and_then(|v| v.as_str()) {
+                                                        response_content.push_str(text);
+                                                        on_delta(text);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(response_content)
     }
 }
 
@@ -437,6 +567,13 @@ fn log_request(method: &warp::http::Method, path: &str, headers: &warp::http::He
 async fn main() -> Result<()> {
     env_logger::init();
     let args = Args::parse();
+
+    match &args.command {
+        Some(Command::Cli { .. }) => {
+            return run_cli(args).await;
+        }
+        _ => {}
+    }
 
     println!("Initializing Codex OpenAI Proxy...");
     
@@ -514,6 +651,74 @@ async fn main() -> Result<()> {
     warp::serve(routes)
         .run(([0, 0, 0, 0], args.port))
         .await;
+
+    Ok(())
+}
+
+async fn run_cli(args: Args) -> Result<()> {
+    let (file, prompt, output, model, no_stdout) = match args.command {
+        Some(Command::Cli { file, prompt, output, model, no_stdout }) => (file, prompt, output, model, no_stdout),
+        _ => unreachable!("run_cli called without cli command"),
+    };
+
+    let mut input = String::new();
+
+    if let Some(p) = prompt {
+        input.push_str(&p);
+    }
+
+    if let Some(path) = file {
+        let content = tokio::fs::read_to_string(&path)
+            .await
+            .with_context(|| format!("Failed to read input file: {}", path))?;
+        if !input.is_empty() {
+            input.push('\n');
+        }
+        input.push_str(&content);
+    }
+
+    if input.is_empty() {
+        return Err(anyhow::anyhow!("Either --prompt/-p or --file/-f is required"));
+    }
+
+    let proxy = ProxyServer::new(&args.auth_path).await?;
+
+    let chat_req = ChatCompletionsRequest {
+        model,
+        messages: vec![ChatMessage {
+            role: "user".to_string(),
+            content: Value::String(input),
+        }],
+        temperature: None,
+        max_tokens: None,
+        stream: Some(true),
+        tools: None,
+        tool_choice: None,
+    };
+
+    let responses_req = proxy.convert_chat_to_responses(chat_req);
+
+    let mut stdout = io::stdout();
+    let stream_to_stdout = !no_stdout;
+    let content = proxy
+        .stream_responses_text(responses_req, |delta| {
+            if stream_to_stdout {
+                let _ = write!(stdout, "{}", delta);
+                let _ = stdout.flush();
+            }
+        })
+        .await?;
+
+    if stream_to_stdout {
+        let _ = writeln!(stdout);
+        let _ = stdout.flush();
+    }
+
+    if let Some(out_path) = output {
+        tokio::fs::write(&out_path, content)
+            .await
+            .with_context(|| format!("Failed to write output file: {}", out_path))?;
+    }
 
     Ok(())
 }
@@ -641,29 +846,76 @@ async fn universal_request_handler(
             // Check if streaming is requested
             if chat_req.stream.unwrap_or(false) {
                 println!("🔄 STREAMING: CLINE requested streaming response, implementing SSE format");
-                
-                // Generate contextual response based on user messages
-                let message = improved_response::generate_contextual_response(&chat_req.messages);
-                println!("📝 Generated contextual response: {}", &message[..std::cmp::min(100, message.len())]);
-                
-                let chunk_id = "chatcmpl-streaming-12345";
-                let model = chat_req.model.clone();
-                
+
+                let response = match proxy.proxy_request(chat_req).await {
+                    Ok(res) => res,
+                    Err(e) => {
+                        eprintln!("Proxy error (stream): {:#}", e);
+                        return Ok(warp::reply::with_status(
+                            "Proxy error",
+                            warp::http::StatusCode::BAD_GATEWAY,
+                        )
+                        .into_response());
+                    }
+                };
+
+                let message = response
+                    .choices
+                    .get(0)
+                    .map(|c| c.message.content.clone())
+                    .unwrap_or_default();
+
+                let response_id = response.id.clone();
+                let response_model = response.model.clone();
+                let created = response.created;
+
                 let sse_chunks = vec![
                     // First chunk with role
-                    format!("data: {{\"id\":\"{}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"{}\",\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\"}},\"finish_reason\":null}}]}}\n\n", 
-                            chunk_id, chrono::Utc::now().timestamp(), model),
+                    json!({
+                        "id": response_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": response_model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": { "role": "assistant" },
+                            "finish_reason": serde_json::Value::Null
+                        }]
+                    }),
                     // Content chunk
-                    format!("data: {{\"id\":\"{}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"{}\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{}\"}},\"finish_reason\":null}}]}}\n\n", 
-                            chunk_id, chrono::Utc::now().timestamp(), model, message),
+                    json!({
+                        "id": response_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": response_model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": { "content": message },
+                            "finish_reason": serde_json::Value::Null
+                        }]
+                    }),
                     // Final chunk
-                    format!("data: {{\"id\":\"{}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"{}\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\n", 
-                            chunk_id, chrono::Utc::now().timestamp(), model),
-                    // End marker
-                    "data: [DONE]\n\n".to_string(),
+                    json!({
+                        "id": response_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": response_model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {},
+                            "finish_reason": "stop"
+                        }]
+                    }),
                 ];
-                
-                let sse_response = sse_chunks.join("");
+
+                let mut sse_response = String::new();
+                for chunk in sse_chunks {
+                    sse_response.push_str("data: ");
+                    sse_response.push_str(&chunk.to_string());
+                    sse_response.push_str("\n\n");
+                }
+                sse_response.push_str("data: [DONE]\n\n");
+
                 let reply = warp::reply::with_header(sse_response, "content-type", "text/event-stream");
                 let reply = warp::reply::with_header(reply, "cache-control", "no-cache");
                 let reply = warp::reply::with_header(reply, "connection", "keep-alive");
